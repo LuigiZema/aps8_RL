@@ -65,8 +65,6 @@ jupyter notebook aps8_final.ipynb
 
 O notebook detecta automaticamente se os modelos já existem (`SKIP_IF_EXISTS=True`) e carrega sem retreinar (~5 segundos). Para forçar retreinamento completo, delete `ppo_88_5x5.zip` e `ppo_88_10x10.zip`.
 
-Tempo estimado de treinamento do zero: ~28 minutos (E1: ~4 min, E2: ~24 min).
-
 ---
 
 ## Referências
