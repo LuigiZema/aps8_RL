@@ -2,140 +2,224 @@
 
 **Disciplina:** Reinforcement Learning — Insper  
 **Autor:** Luigi Zema Matizonkas  
-**Data:** 08/05/2026
+**Data:** 08/05/2026  
 
----
+## 1. Introdução
 
-## O problema
+O objetivo desta APS foi desenvolver uma estratégia de aprendizado por reforço para resolver um problema de Coverage Path Planning. Nesse problema, o agente deve visitar todas as células livres de um grid com obstáculos.
 
-O agente precisa cobrir cada célula livre de um grid com obstáculos — sem nunca ter acesso ao mapa global. A única informação disponível a cada passo é a janela 3×3 ao redor do agente: quais células são livres, quais são obstáculos, qual é a cobertura atual. O ambiente é o `GridWorldCPPEnv` do professor, usado sem modificações.
+O ambiente utilizado foi o `GridWorldCPPEnv`, disponibilizado pelo professor. O ambiente original não foi alterado diretamente. As modificações foram feitas por meio de wrappers e estratégias de treinamento.
 
-A meta é atingir cobertura completa em ≥ 90 de 100 episódios tanto no 5×5 quanto no 10×10. Um ponto de bônus para quem conseguir o mesmo no 20×20.
+A principal restrição do problema é que o agente não recebe o mapa global real. A observação original é apenas uma janela 3x3 ao redor da posição atual. Isso torna o problema mais difícil, porque o agente precisa decidir para onde ir sem saber diretamente quais regiões do grid ainda faltam ser visitadas.
 
----
+A meta principal era atingir cobertura completa em pelo menos 90 de 100 episódios nos ambientes 5x5 e 10x10. O ambiente 20x20 foi utilizado como tentativa de bônus.
 
-## Por onde começa
+## 2. Baseline inicial
 
-Antes de escrever qualquer linha de código, rodei o baseline do professor para entender onde ele falha. O resultado foi 75/100 no 5×5 e 65/100 no 10×10 — útil como referência, mas claramente insuficiente.
+Antes de desenvolver a solução final, executei o baseline do professor para entender o comportamento inicial do agente.
 
-O problema do baseline é estrutural: ele recebe o `coverage_ratio` (fração coberta), mas não **onde** estão as células não visitadas. O agente sabe que falta cobrir 30% do grid, mas não tem ideia de onde estão esses 30%. Sem essa informação, ele revisita células já visitadas, entra em loops, e frequentemente termina com uma ilha de células não visitadas no canto oposto ao seu ponto atual — sem conseguir chegar lá dentro do limite de passos.
+Os resultados observados foram:
 
----
+| Modelo | 5x5 | 10x10 |
+|---|---:|---:|
+| Baseline do professor | 75/100 | 65/100 |
 
-## Primeira tentativa: observação 3×3 direta
+Esse resultado mostrou que o PPO direto sobre a observação original consegue aprender parte da tarefa, mas ainda falha em muitos episódios.
 
-A primeira ideia foi simples: usar a janela 3×3 diretamente, mas adicionar sinais calculados sobre um histórico de posições. Calculei direção e distância até a célula não visitada mais próxima usando um buffer de visitas recentes, e adicionei um histórico das 4 últimas ações para o agente detectar loops.
+A principal limitação observada foi que o agente sabe a fração de cobertura atingida, mas não sabe claramente onde estão as células ainda não visitadas. Com isso, ele tende a revisitar regiões já cobertas, entrar em loops e deixar pequenas áreas sem cobertura completa.
 
-O resultado foi razoável no 5×5: 87/100. Mas no 10×10 zero-shot foi um desastre — **27/100**. O problema ficou claro: sem um mapa acumulado, o agente "esquece" o que visitou assim que sai do raio de visão 3×3. Em um grid maior, essa amnésia é fatal — o sinal de "célula mais próxima não visitada" aponta para uma célula que o agente já visitou há 50 passos, mas que o buffer não registrou.
+## 3. Representação de estado: 3x3 e 5x5
 
----
+A observação original do ambiente é uma janela 3x3 ao redor do agente. Essa observação é importante porque representa a restrição principal do problema: o agente tem apenas informação local e não pode acessar diretamente o mapa global real.
 
-## A virada: mapa acumulado + patch 5×5
+Na primeira tentativa, mantive a representação mais próxima da observação original, usando a informação local 3x3 com alguns sinais adicionais. Essa abordagem melhorou o desempenho no 5x5, mas não generalizou bem para o 10x10.
 
-A solução que funcionou foi construir um mapa interno persistente — um array `_mem` do mesmo tamanho do grid, atualizado a cada step com os 9 pixels da janela 3×3. Cada célula tem um estado: desconhecida (0), obstáculo (1), visitada (2), ou frontier — livre e vista, mas ainda não visitada (3).
+Por isso, na solução final, usei uma representação baseada em um patch 5x5 centrado no agente. Esse patch 5x5 não é retirado do mapa global real. Ele é extraído da memória acumulada observada pelo agente, que é construída passo a passo a partir das observações locais recebidas durante o episódio.
 
-Com esse mapa disponível, dois problemas se resolvem de uma vez:
+A escolha pelo patch 5x5 teve três motivos principais:
 
-**Primeiro:** em vez de passar a janela 3×3 bruta, extraio um **patch 5×5** centrado no agente diretamente do `_mem`. Isso dá ao agente um contexto espacial muito mais rico — ele vê 5 células em cada direção ao invés de 1 — e ainda é invariante ao tamanho do grid, porque o agente está sempre em `patch[2,2]`. O mesmo formato funciona no 5×5, no 10×10 e no 20×20.
+- Dar mais contexto local ao agente do que a janela 3x3 original
+- Reduzir loops e movimentos repetitivos em regiões já cobertas
+- Melhorar a generalização do 5x5 para o 10x10, mantendo o mesmo formato de entrada para o modelo
 
-**Segundo:** os sinais de frontier agora são calculados sobre o mapa inteiro, não só sobre a vizinhança imediata. O agente sabe a direção da célula não visitada mais próxima, sua distância, e quantas células não visitadas existem em cada quadrante. Isso funciona mesmo que a célula mais próxima esteja a 15 passos de distância.
+Assim, a solução continua respeitando a limitação de observação parcial. O agente não recebe o mapa completo. Ele recebe uma representação local mais rica, construída apenas com informações que ele já observou.
 
-Junto com isso, adicionei um **histórico das 4 últimas ações** como one-hot (16 bits), que permite ao modelo detectar o padrão de loop (direita→cima→esquerda→baixo repetido) e mudar de comportamento.
+## 4. Primeira tentativa: observação 3x3 com sinais adicionais
 
-O resultado foi imediato: **97/100 no 5×5** após 600k steps. E o modelo treinado apenas no 5×5 atingiu **90/100 no 10×10 zero-shot** — sem nenhum retreinamento. A invariância do patch 5×5 funcionou exatamente como esperado.
+A primeira tentativa foi manter a observação 3x3, mas adicionar alguns sinais auxiliares ao agente, como direção aproximada até células ainda não visitadas e histórico recente de ações.
 
-Para o 10×10, continuar treinando a partir do modelo E1 com `set_env()` por mais 1.5M steps resultou em **91/100**. Os pontos 1 e 2 estavam garantidos.
+Essa abordagem melhorou o desempenho no 5x5, mas não generalizou bem para o 10x10.
 
----
+| Estratégia | 5x5 | 10x10 zero-shot |
+|---|---:|---:|
+| Frontier 3x3 sem mapa acumulado | 87/100 | 27/100 |
 
-## Tentativa de bônus: o 20×20
+O resultado no 10x10 mostrou que a observação 3x3 ainda era limitada demais. Em grids maiores, o agente rapidamente perde referência de regiões já visitadas e de regiões que ainda faltam ser cobertas.
 
-Com os dois pontos garantidos, começou a parte mais interessante — e mais frustrante: tentar atingir 90/100 no 20×20.
+Essa tentativa foi importante para mostrar que o problema não era apenas de algoritmo ou hiperparâmetro. A representação do estado precisava carregar melhor a informação espacial acumulada ao longo do episódio.
 
-A primeira abordagem foi simplesmente continuar o currículo: carregar o modelo E2 e treinar no 20×20. Isso produziu ~78% nos primeiros experimentos, mas havia um problema: os primeiros testes usavam `max_steps=4000-5000`, muito acima do budget real do professor (1000 passos). Com `max_steps=1000`, o resultado ficou em **78/100 com mean_steps=664** — o agente usa bem o orçamento disponível, mas 22% dos episódios terminam em timeout.
+## 5. Solução final: FrontierMemoryWrapper
 
-### LSTM — o atalho que não funcionou
+A solução que apresentou melhor desempenho foi a criação do `FrontierMemoryWrapper`.
 
-Em paralelo, tentei `RecurrentPPO + MultiInputLstmPolicy` na esperança de que a memória recorrente compensasse a necessidade de mapa acumulado. Não funcionou: o LSTM foi treinado com episódios de ~165 passos (10×10), e no 20×20 os episódios chegam a 1000 passos — 6× mais longos. O BPTT sobre sequências longas produziu gradientes que destruíram os pesos:
+Esse wrapper mantém uma memória acumulada chamada `_mem`. Essa memória não representa o mapa global real do ambiente. Ela é construída passo a passo, usando apenas a janela 3x3 observada pelo agente em cada instante.
 
-| | 10×10 antes | 10×10 depois | 20×20 |
-|---|---|---|---|
-| FrontierMemoryWrapper | 91% | — | 77% |
-| RecurrentPPO + LSTM | — | **60%** | **44%** |
+Cada célula da memória pode representar, de forma simplificada:
 
-A lição foi importante: o mapa externo determinístico escala melhor que LSTM precisamente porque é construído sem gradiente. É exato, não sofre vanishing gradient, e funciona igualmente em qualquer grid.
+- célula desconhecida
+- obstáculo observado
+- célula livre já visitada
+- célula livre observada, mas ainda não visitada
 
-### O diagnóstico do plateau
+A partir dessa memória acumulada, o wrapper gera uma observação mais rica para o modelo PPO.
 
-Depois de várias tentativas (progressive reward, estágio intermediário 15×15, potential-based shaping, currículo de obstáculos), o resultado continuava convergindo para 77-78%. Fiz uma análise de 200 episódios para entender por quê:
+## 6. Componentes da representação
 
-- **100% das falhas são truncamentos** — o agente não chega a uma conclusão errada, simplesmente fica sem tempo.
-- **67% das falhas têm exatamente 1 célula faltando.** O agente cobre 399/400 células e fica sem passos.
-- **Spawn não é a causa** — posição inicial em episódios que falham e que têm sucesso é estatisticamente idêntica.
-- **As falhas são determinísticas** — as mesmas seeds sempre falham, nas mesmas coberturas.
+A observação final usada pelo agente combina três grupos principais de informação.
 
-O problema fica claro: certos layouts de obstáculos criam uma célula isolada que o agente não consegue alcançar dentro de 1000 passos. O agente **sabe** onde ela está — o sinal `dx_front/dy_front` aponta na direção certa — mas o caminho real até ela contorna vários obstáculos e é muito mais longo do que a distância Manhattan sugere.
+### 6.1 Patch 5x5 centrado no agente
 
-### Por que o sinal de frontier engana
+Em vez de usar apenas a janela 3x3 original, passei a usar um patch 5x5 extraído da memória acumulada.
 
-O sinal `dx_front/dy_front` calcula distância Manhattan — ele aponta para a célula mais próxima "em linha reta". Se há uma parede entre o agente e essa célula, o sinal diz "vá para a direita" quando o caminho real exige ir para a esquerda, dar a volta, e então entrar pela direita. O agente tenta ir direto, bate na parede, e fica oscilando — desperdiçando a maior parte dos 1000 passos disponíveis.
+O agente fica sempre no centro desse patch. Isso torna a representação invariante ao tamanho do grid. O mesmo formato de entrada pode ser usado em ambientes 5x5, 10x10 e 20x20.
 
-A correção lógica é usar **BFS a partir da posição atual**, respeitando os obstáculos já registrados em `_mem`, para calcular o caminho real até as células isoladas. O mapa acumulado já contém essa informação — falta apenas usá-la na hora de gerar o sinal de navegação.
+Essa escolha foi importante para permitir generalização entre tamanhos diferentes de ambiente.
 
-### Diagnóstico de credit assignment (Deep-E3)
+### 6.2 Sinais de frontier
 
-Antes da solução BFS, identifiquei e corrigi um problema de hiperparâmetros que limitava o treinamento no 20×20:
+Além do patch 5x5, o wrapper calcula sinais relacionados às células ainda não visitadas, chamadas de frontier.
 
-Com `n_steps=2048, N=8 envs` → apenas 256 passos/env entre updates. Um episódio 20×20 tem ~641 passos — ocupa 2.5 rollouts. O reward das últimas células sofre `γ^641 = 0.99^641 ≈ 0.001` — praticamente invisível ao gradiente.
+Esses sinais incluem:
 
-A correção foi `n_steps=4096, N=4` (1024 passos/env) e `gamma=0.998` (peso no passo 641 = 0.28, 280× maior). Isso é o modelo "Deep-E3" — resultou em 77/100 estável, confirmando que o plateau não era de hiperparâmetros, mas estrutural da observação Manhattan.
+- direção aproximada até a célula frontier mais próxima
+- distância aproximada até essa célula
+- quantidade de células frontier por quadrante
 
----
+Essas informações ajudam o agente a entender para qual região do grid ainda existe cobertura pendente.
 
-## Resultados
+### 6.3 Histórico de ações
 
-| Modelo | 5×5 | 10×10 | 20×20 | max_steps |
-|---|---|---|---|---|
-| Baseline professor | 75/100 | 65/100 | — | 1000 |
-| 3×3 direto (sem mapa) | 87/100 | 27/100 zero-shot | — | — |
-| **E1 — mapa + patch 5×5** | **97/100 ✅** | 90/100 zero-shot | — | — |
-| **E2 — continuação 10×10** | — | **91/100 ✅** | 77/100 zero-shot | — |
-| LSTM (RecurrentPPO) | — | 60/100 | 44/100 | — |
-| Deep-E3 (γ=0.998) | 95/100 | 91/100 | 77/100 | **1000** |
-| **8.13 V3 — currículo obstáculos** | — | 89/100 | **78/100** | **1000** |
+Também foi adicionado um histórico das últimas 4 ações, codificado como one-hot.
 
-**Pontos garantidos: 2/2.** Melhor resultado bônus: 78/100 no 20×20 (arquivo `ppo_best_20x20.pt`).
+Esse histórico ajuda o agente a identificar padrões de loop. Por exemplo, quando ele começa a repetir movimentos como direita, cima, esquerda e baixo, essa informação aparece no estado e pode ser usada pela política para evitar ciclos improdutivos.
 
----
+## 7. Treinamento com PPO
 
-## Os modelos entregues
+O algoritmo principal utilizado foi o PPO, por ser estável e adequado para ambientes com política estocástica.
 
-| Arquivo | Formato | Descrição |
-|---|---|---|
-| `ppo_88_5x5.zip` | SB3 `.zip` | E1 — **97/100 no 5×5** (Ponto 1) |
-| `ppo_88_10x10.zip` | SB3 `.zip` | E2 — **91/100 no 10×10** (Ponto 2) |
-| `ppo_best_20x20.pt` | PyTorch `.pt` | Melhor bônus — 78/100 (8.13 V3) |
+A estratégia de treinamento foi organizada em etapas:
 
-Os modelos `.zip` usam o formato nativo do SB3 (`model.save()`). O modelo 20×20 foi salvo como `.pt` porque o formato `.zip` do SB3 falha com PyTorch ≥ 2.1 (`RuntimeError: PytorchStreamReader`) — um bug de compatibilidade entre o leitor C++ legado e metadados adicionados em versões novas do PyTorch. O notebook inclui `bypass_load()` que contorna o problema para os `.zip`, e `load_pt()` para o `.pt`.
+1. Treinamento inicial no ambiente 5x5
+2. Avaliação zero-shot no 10x10
+3. Continuação do treinamento no ambiente 10x10
+4. Tentativas adicionais no ambiente 20x20 para o bônus
 
----
+O modelo treinado no 5x5 conseguiu generalizar diretamente para o 10x10, o que confirmou que a representação baseada em memória acumulada e patch centrado no agente estava funcionando.
 
-## O que fica de aprendizado
+## 8. Resultados principais
 
-**Mapa externo explícito bate LSTM.** O FrontierMemoryWrapper é determinístico, exato, e escala para qualquer grid sem retreinamento. O LSTM precisa de BPTT — e em sequências longas isso destrói os pesos do curriculum.
+Os principais resultados foram:
 
-**Observação invariante ao grid possibilita zero-shot.** O patch 5×5 centrado no agente é sempre o mesmo formato, independente do grid. Um modelo treinado no 5×5 funciona diretamente no 10×10 — e 90/100 zero-shot confirma que a representação generalizou.
+| Experimento | 5x5 | 10x10 | 20x20 | Observação |
+|---|---:|---:|---:|---|
+| Baseline do professor | 75/100 | 65/100 | — | Referência inicial |
+| Frontier 3x3 sem mapa acumulado | 87/100 | 27/100 zero-shot | — | Não generalizou para 10x10 |
+| E1 — PPO + FrontierMemoryWrapper | 97/100 | 90/100 zero-shot | — | Treinado no 5x5 |
+| E2 — Curriculum 5x5 para 10x10 | — | 91/100 | 77/100 zero-shot | Modelo final do critério principal |
+| LSTM | — | 60/100 | 44/100 | Tentativa com memória recorrente |
+| Melhor tentativa 20x20 | — | 89/100 | 78/100 | Melhor resultado de bônus |
 
-**Credit assignment importa mais do que hiperparâmetros individuais.** A descoberta mais surpreendente foi que `n_steps=2048, N=8` efetivamente tornava o reward das últimas células invisível ao gradiente. Corrigir isso foi uma das mudanças mais impactantes.
+Os modelos finais entregues foram:
 
-**O plateau a 78% é estrutural.** Após todas as tentativas, ficou claro que a limitação não é de policy, reward, ou hiperparâmetros — é que o sinal Manhattan engana o agente nos layouts com células isoladas. A solução natural é BFS, e essa é a linha de desenvolvimento que ficou aberta.
+| Arquivo | Descrição |
+|---|---|
+| `ppo_88_5x5.zip` | Modelo PPO com 97/100 no 5x5 |
+| `ppo_88_10x10.zip` | Modelo PPO com 91/100 no 10x10 |
+| `ppo_best_20x20.pt` | Melhor modelo obtido para o 20x20, com 78/100 |
 
----
+## 9. Análise do desempenho no 5x5 e 10x10
 
-## Referências
+No 5x5, o modelo final atingiu 97/100. Esse resultado mostra que a política aprendeu uma estratégia de cobertura bastante robusta para o ambiente menor.
 
-- Repositório do professor: [github.com/fbarth/gym_custom_env](https://github.com/fbarth/gym_custom_env)
-- Raffin et al. (2021). *Stable-Baselines3: Reliable RL Implementations*. JMLR
-- Schulman et al. (2017). *Proximal Policy Optimization*. arXiv:1707.06347
-- Ng, Harada & Russell (1999). *Policy Invariance Under Reward Transformations*. ICML
-- Dohare et al. (2024). *Loss of Plasticity in Deep Continual Learning*. Nature
+O ponto mais relevante, porém, foi o resultado zero-shot no 10x10. O modelo treinado apenas no 5x5 atingiu 90/100 no 10x10, antes de qualquer retreinamento nesse tamanho.
+
+Isso indica que a representação proposta não estava simplesmente memorizando trajetórias do 5x5. Ela permitiu ao agente transferir uma estratégia de cobertura para um ambiente maior.
+
+Depois da continuação do treinamento no 10x10, o desempenho final chegou a 91/100, atendendo ao critério principal da APS.
+
+## 10. Tentativa de bônus no 20x20
+
+Após atingir os resultados necessários no 5x5 e no 10x10, testei diferentes estratégias para melhorar o desempenho no 20x20.
+
+Entre as tentativas, foram explorados:
+
+- continuação do curriculum para 20x20
+- ajuste de hiperparâmetros
+- uso de estágios intermediários
+- reward shaping
+- tentativa com LSTM
+- aumento de horizonte de rollout
+- análise do limite de passos
+
+O melhor resultado obtido foi 78/100 no 20x20.
+
+Esse resultado ficou abaixo do critério de bônus, mas mostrou que a estratégia ainda conseguia cobrir quase todo o grid em muitos episódios.
+
+## 11. Por que o 20x20 travou em aproximadamente 78%
+
+A análise dos episódios com falha indicou que o problema principal não era a falta de cobertura média. Em muitos casos, o agente chegava muito próximo da cobertura completa, mas deixava uma ou poucas células faltando.
+
+O principal motivo identificado foi a limitação do sinal de frontier baseado em distância aproximada. Esse sinal indica a direção de uma célula ainda não visitada, mas não considera necessariamente o caminho real até ela quando existem obstáculos no meio.
+
+Em alguns layouts, a célula restante parece próxima pela distância Manhattan, mas o caminho real exige dar uma volta longa em torno de obstáculos. Nesses casos, o agente pode tentar ir na direção aparentemente correta, bater em obstáculos ou oscilar, gastando muitos passos.
+
+Por isso, a limitação do 20x20 parece estar mais ligada à qualidade do sinal de navegação do que à capacidade básica do PPO.
+
+Uma melhoria natural seria substituir a direção baseada em distância Manhattan por uma busca BFS sobre a memória acumulada observada. Isso permitiria calcular caminhos mais realistas até as células frontier, respeitando os obstáculos já conhecidos pelo agente.
+
+## 12. Tentativa com LSTM
+
+Também testei uma abordagem com memória recorrente usando LSTM.
+
+A hipótese era que a LSTM poderia aprender uma memória interna útil para lidar com a observação parcial. Porém, o resultado foi inferior ao wrapper com memória externa.
+
+| Modelo | 10x10 | 20x20 |
+|---|---:|---:|
+| FrontierMemoryWrapper | 91/100 | 77/100 zero-shot |
+| RecurrentPPO com LSTM | 60/100 | 44/100 |
+
+A principal conclusão foi que a memória externa determinística funcionou melhor do que tentar aprender memória apenas por recorrência.
+
+No caso do LSTM, a sequência de decisões no 20x20 é muito mais longa. Isso dificulta o treinamento por BPTT e pode causar perda de desempenho em relação aos modelos anteriores.
+
+## 13. Principais aprendizados
+
+O primeiro aprendizado foi que a representação do estado é decisiva em problemas de observação parcial. O PPO sozinho, usando apenas a janela 3x3, não tinha informação suficiente para resolver bem o problema em grids maiores.
+
+O segundo aprendizado foi que uma memória externa simples pode ser mais eficiente do que uma memória recorrente aprendida. O `FrontierMemoryWrapper` guarda de forma explícita o que já foi observado, sem depender de gradientes para lembrar regiões antigas do mapa.
+
+O terceiro aprendizado foi que a invariância da observação ajudou muito na generalização. Como o agente sempre recebe um patch 5x5 centrado nele, a entrada do modelo tem o mesmo formato no 5x5 e no 10x10.
+
+Por fim, o 20x20 mostrou que a cobertura completa em ambientes maiores exige não apenas memória, mas também um sinal de navegação mais inteligente. A próxima melhoria natural seria calcular caminhos até frontier usando BFS sobre a memória acumulada observada.
+
+## 14. Conclusão
+
+A solução desenvolvida atingiu o objetivo principal da APS.
+
+O modelo final obteve:
+
+- 97/100 no ambiente 5x5
+- 91/100 no ambiente 10x10
+- 78/100 no ambiente 20x20, como tentativa de bônus
+
+A estratégia mais importante foi a criação do `FrontierMemoryWrapper`, que transformou a observação parcial em uma representação mais útil, mantendo a restrição de não acessar o mapa global real do ambiente.
+
+A solução demonstrou boa generalização do 5x5 para o 10x10 e permitiu cumprir os critérios principais da atividade.
+
+## 15. Referências
+
+- Material da aula 23: https://insper.github.io/rl/classes/23_custom_env_agent/
+- Repositório do professor: https://github.com/fbarth/gym_custom_env
+- Stable-Baselines3: https://github.com/DLR-RM/stable-baselines3
+- Schulman et al. (2017). Proximal Policy Optimization Algorithms.
+- Raffin et al. (2021). Stable-Baselines3: Reliable Reinforcement Learning Implementations.
